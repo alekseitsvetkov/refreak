@@ -1,0 +1,73 @@
+import select from 'select-dom'
+import createFeaturedPlayerBadgeElement from '../components/player-badge'
+import {
+  hasFeatureAttribute,
+  setFeatureAttribute,
+} from '../helpers/dom-element'
+import { getMatch } from '../helpers/faceit-api'
+import { getRoomId } from '../helpers/match-room'
+import { getPlayerBadges } from '../helpers/player-badges'
+
+const FEATURE_ATTRIBUTE = 'match-room-player-badges'
+
+export default async () => {
+  const matchRoomContentElement = select('[class*="Overview__Holder"]')
+
+  if (
+    !matchRoomContentElement ||
+    hasFeatureAttribute(FEATURE_ATTRIBUTE, matchRoomContentElement)
+  ) {
+    return
+  }
+
+  setFeatureAttribute(FEATURE_ATTRIBUTE, matchRoomContentElement)
+
+  const roomId = getRoomId()
+  const match = await getMatch(roomId)
+
+  const matchPlayers = [
+    ...match.teams.faction1.roster,
+    ...match.teams.faction2.roster,
+  ]
+
+  const matchPlayerBadges = await getPlayerBadges(
+    matchPlayers.map((matchPlayer) => matchPlayer.id),
+  )
+
+  const matchPlayerElements = ['roster1', 'roster2'].reduce((acc, roster) => {
+    acc.push(
+      ...select.all(
+        `div[name="${roster}"] [class*="ListContentPlayer__Body"]`,
+        matchRoomContentElement,
+      ),
+    )
+
+    return acc
+  }, [])
+
+  for (const matchPlayerElement of matchPlayerElements) {
+    const matchPlayerNicknameElement = select(
+      '[class*="Nickname__Name"]',
+      matchPlayerElement,
+    )
+
+    const playerBadge =
+      matchPlayerBadges[
+        matchPlayers.find(
+          (matchPlayer) =>
+            matchPlayer.nickname === matchPlayerNicknameElement.innerText,
+        )?.id
+      ]
+
+    if (playerBadge) {
+      const playerBadgeElement = createFeaturedPlayerBadgeElement(playerBadge)
+
+      const matchPlayerInfoElement = select(
+        '[class*="NamesContainer"]',
+        matchPlayerElement,
+      )
+
+      matchPlayerInfoElement.prepend(playerBadgeElement)
+    }
+  }
+}
