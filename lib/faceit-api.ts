@@ -1,239 +1,201 @@
-import { storage } from '#imports'
-import { FACEIT_CONFIG, validateConfig } from './config'
+import { FACEIT_CONFIG } from './config'
+import { getFromCache, saveToCache } from './cache-sync'
 
-// Define cache storage item
-const faceitCache = storage.defineItem<Record<string, { data: any; timestamp: number }>>('local:faceitCache', {
-  fallback: {}
-})
+// ============================================================================
+// TYPES
+// ============================================================================
 
-// Types for Open API
 export interface FaceitUser {
-  userId: string
-  nickname: string
-  avatar?: string
-  country?: string
-  level?: number
-  id?: string // Add id field for API compatibility
-}
-
-// Open API response types
-export interface OpenApiPlayer {
-  player_id: string
-  nickname: string
-  avatar?: string
-  country?: string
-  skill_level?: number
-  faceit_url?: string
-  membership_type?: string
-  memberships?: string[]
-  games?: Record<string, {
-    game_id: string
-    skill_level?: number
-    region?: string
-    game_player_id?: string
-    skill_level_label?: string
-  }>
-}
-
-export interface OpenApiPlayerStats {
-  player_id: string
-  game_id: string
-  lifetime: {
-    'Recent Results'?: string[]
-    'Average K/D Ratio'?: string
-    'Average Headshots %'?: string
-    'Total Headshots %'?: string
-    'Current Win Streak'?: string
-    'Matches'?: string
-    'Average K/R Ratio'?: string
-    'Total Headshots'?: string
-    'Win Rate %'?: string
-    'Average Triple Kills'?: string
-    'Average Quadro Kills'?: string
-    'Average Penta Kills'?: string
-    'K/D Ratio'?: string
-    'Longest Win Streak'?: string
-    'Average Kills'?: string
-    'Total Matches'?: string
-    'Average Deaths'?: string
-    'Total Kills'?: string
-    'Total Deaths'?: string
-    'Average MVPs'?: string
-    'Total MVPs'?: string
-    'Average ADR'?: string
-    'ADR'?: string
-    'Average Damage'?: string
-    'Damage'?: string
-  }
-  segments?: Array<{
-    type: string
-    attributes: Record<string, any>
-    metadata: Record<string, any>
-  }>
+  readonly userId: string
+  readonly nickname: string
+  readonly avatar?: string
+  readonly country?: string
+  readonly level?: number
+  readonly id?: string // Add id field for API compatibility
 }
 
 export interface FaceitMatch {
-  matchId: string
-  gameId: string
-  state: string
-  faction1: FaceitPlayer[]
-  faction2: FaceitPlayer[]
-  teams?: {
-    faction1: { roster: FaceitPlayer[] }
-    faction2: { roster: FaceitPlayer[] }
+  readonly matchId: string
+  readonly gameId: string
+  readonly state: string
+  readonly faction1: FaceitPlayer[]
+  readonly faction2: FaceitPlayer[]
+  readonly teams?: {
+    readonly faction1: { readonly roster: FaceitPlayer[] }
+    readonly faction2: { readonly roster: FaceitPlayer[] }
   }
-  entityCustom?: {
-    parties: Record<string, string[]>
+  readonly entityCustom?: {
+    readonly parties: Record<string, string[]>
   }
 }
 
 export interface FaceitPlayer {
-  id: string
-  nickname: string
-  avatar?: string
-  skillLevel?: number
-  activeTeamId?: string
+  readonly id: string
+  readonly nickname: string
+  readonly avatar?: string
+  readonly skillLevel?: number
+  readonly activeTeamId?: string
 }
 
 export interface PlayerStats {
-  matches: number
-  averageKDRatio: number
-  averageKRRatio: number
-  averageHeadshots: number
-  averageKills: number
-  averageADR: number
-  winRate: number
+  readonly matches: number
+  readonly averageKDRatio: number
+  readonly averageKRRatio: number
+  readonly averageHeadshots: number
+  readonly averageKills: number
+  readonly averageADR: number
+  readonly winRate: number
 }
 
 export interface MatchHistory {
-  items: Array<{
-    matchId: string
-    gameId: string
-    nickname: string
-    i1: string // map name
-    i2: string // team id
-    i10: string // result (1 = win, 0 = loss)
-    timestamp: number // timestamp for age calculation
+  readonly items: Array<{
+    readonly matchId: string
+    readonly gameId: string
+    readonly nickname: string
+    readonly i1: string // map name
+    readonly i2: string // team id
+    readonly i10: string // result (1 = win, 0 = loss)
+    readonly timestamp: number // timestamp for age calculation
   }>
 }
 
-// Constants
-const FACEIT_API_BASE_URL = 'https://www.faceit.com/api' // Legacy API (fallback)
-// const CACHE_TIME = FACEIT_CONFIG.CACHE_TIME
-const CACHE_TIME = 0
+export interface PlayerData {
+  readonly player: FaceitUser | null
+  readonly stats: PlayerStats | null
+  readonly history: MatchHistory | null
+}
+
+export interface ApiResponse<T> {
+  readonly success: boolean
+  readonly data: T | null
+  readonly error?: string
+}
+
+export interface CacheEntry<T> {
+  readonly data: T
+  readonly timestamp: number
+}
+
+export type CacheType = 'player' | 'playerStats' | 'playerHistory' | 'match' | 'multiplePlayers'
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const FACEIT_API_BASE_URL = 'https://www.faceit.com/api' as const
+const CACHE_TIME = FACEIT_CONFIG.CACHE_TIME
 const SUPPORTED_GAMES = new Set(['csgo', 'cs2'])
+const BATCH_SIZE = 3 as const
+const MAX_RETRIES = 5 as const
+const BASE_DELAY = 1000 as const
 
-// Cache implementation using WXT storage
-class FaceitApiCache {
-  private static instance: FaceitApiCache
-  private memoryCache = new Map<string, { data: any; timestamp: number }>()
+// ============================================================================
+// UTILITIES
+// ============================================================================
 
-  static getInstance(): FaceitApiCache {
-    if (!FaceitApiCache.instance) {
-      FaceitApiCache.instance = new FaceitApiCache()
+/**
+ * Utility class for common operations
+ */
+export class FaceitUtils {
+  /**
+   * Convert snake_case keys to camelCase
+   */
+  static camelCaseKeys<T>(obj: T): T {
+    if (Array.isArray(obj)) {
+      return obj.map(this.camelCaseKeys) as T
     }
-    return FaceitApiCache.instance
-  }
-
-  async get(key: string): Promise<any | null> {
-    // Check memory cache first (fastest)
-    const memoryCached = this.memoryCache.get(key)
-    if (memoryCached && Date.now() - memoryCached.timestamp < CACHE_TIME) {
-      console.log(`Memory cache hit for: ${key}`)
-      return memoryCached.data
-    }
-
-    // Check browser storage cache
-    try {
-      const cacheData = await faceitCache.getValue()
-      const cached = cacheData[key]
-      if (cached && Date.now() - cached.timestamp < CACHE_TIME) {
-        console.log(`Storage cache hit for: ${key}`)
-        // Update memory cache
-        this.memoryCache.set(key, cached)
-        return cached.data
+    
+    if (obj !== null && typeof obj === 'object') {
+      const result = {} as any
+      for (const [key, value] of Object.entries(obj)) {
+        const camelKey = key.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase())
+        result[camelKey] = this.camelCaseKeys(value)
       }
-    } catch (error) {
-      console.warn('Failed to read from storage cache:', error)
+      return result
     }
 
-    return null
+    return obj
   }
 
-  async set(key: string, data: any): Promise<void> {
-    const cacheEntry = { data, timestamp: Date.now() }
-    
-    // Update memory cache
-    this.memoryCache.set(key, cacheEntry)
-    
-    // Update browser storage cache
-    try {
-      const cacheData = await faceitCache.getValue()
-      cacheData[key] = cacheEntry
-      await faceitCache.setValue(cacheData)
-      console.log(`Cached data for: ${key}`)
-    } catch (error) {
-      console.warn('Failed to write to storage cache:', error)
+  /**
+   * Check if game is supported
+   */
+  static isSupportedGame(game: string): boolean {
+    return SUPPORTED_GAMES.has(game.toLowerCase())
+  }
+
+  /**
+   * Determine cache type based on key
+   */
+  static getCacheType(key: string): CacheType {
+    if (key.startsWith('stats:')) return 'playerStats'
+    if (key.startsWith('history:')) return 'playerHistory'
+    if (key.startsWith('match:')) return 'match'
+    if (key.startsWith('multiple:')) return 'multiplePlayers'
+    return 'player'
+  }
+
+  /**
+   * Ensure userId is set from id field if not present
+   */
+  static ensureUserId(user: any): void {
+    if (user.id && !user.userId) {
+      user.userId = user.id
     }
   }
 
-  async clear(): Promise<void> {
-    this.memoryCache.clear()
-    
-    try {
-      await faceitCache.setValue({})
-      console.log('Cleared all FACEIT cache entries')
-    } catch (error) {
-      console.warn('Failed to clear storage cache:', error)
-    }
+  /**
+   * Calculate exponential backoff delay
+   */
+  static calculateBackoffDelay(attempt: number, baseDelay: number = BASE_DELAY): number {
+    return baseDelay * Math.pow(2, attempt)
   }
 
-  async getCacheInfo(): Promise<{ memorySize: number; storageSize?: number }> {
-    const memorySize = this.memoryCache.size
+  /**
+   * Parse retry-after header
+   */
+  static parseRetryAfter(retryAfter: string | null): number | null {
+    if (!retryAfter) return null
     
-    let storageSize: number | undefined
-    try {
-      const cacheData = await faceitCache.getValue()
-      storageSize = Object.keys(cacheData).length
-    } catch (error) {
-      console.warn('Failed to get storage cache info:', error)
-    }
-    
-    return { memorySize, storageSize }
+    const retryAfterSeconds = parseInt(retryAfter)
+    return isNaN(retryAfterSeconds) ? null : retryAfterSeconds * 1000
   }
 }
 
-// Enhanced request wrapper with 429 handling
-async function makeRequestWithRetry(
+// ============================================================================
+// HTTP CLIENT
+// ============================================================================
+
+/**
+ * Enhanced HTTP client with retry logic and rate limiting
+ */
+export class FaceitHttpClient {
+  /**
+   * Make request with retry logic and rate limiting
+   */
+  static async request<T>(
   url: string, 
   options: RequestInit, 
-  maxRetries: number = 5,
-  baseDelay: number = 1000
-): Promise<any> {
+    maxRetries: number = MAX_RETRIES,
+    baseDelay: number = BASE_DELAY
+  ): Promise<ApiResponse<T>> {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       const response = await fetch(url, options)
       
       // Handle 429 (Too Many Requests) with exponential backoff
       if (response.status === 429) {
-        const retryAfter = response.headers.get('Retry-After')
-        let delay = baseDelay * Math.pow(2, attempt)
-        
-        if (retryAfter) {
-          const retryAfterSeconds = parseInt(retryAfter)
-          if (!isNaN(retryAfterSeconds)) {
-            delay = retryAfterSeconds * 1000
-          }
-        }
+          const retryAfter = FaceitUtils.parseRetryAfter(response.headers.get('Retry-After'))
+          const delay = retryAfter ?? FaceitUtils.calculateBackoffDelay(attempt, baseDelay)
         
         console.warn(`Rate limited (429), retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`)
-        await new Promise(resolve => setTimeout(resolve, delay))
+          await this.delay(delay)
         continue
       }
       
       // Handle 404 (Not Found) - don't retry
       if (response.status === 404) {
-        return null
+          return { success: false, data: null, error: 'Not found' }
       }
       
       // Handle other errors
@@ -242,43 +204,32 @@ async function makeRequestWithRetry(
       }
       
       const data = await response.json()
-      return data
+        return { success: true, data: data as T }
       
     } catch (error) {
       if (attempt === maxRetries - 1) {
         console.error(`Request failed after ${maxRetries} attempts:`, error)
-        throw error
+          return { 
+            success: false, 
+            data: null, 
+            error: error instanceof Error ? error.message : 'Unknown error' 
+          }
       }
       
       // Exponential backoff for other errors
-      const delay = baseDelay * Math.pow(2, attempt)
+        const delay = FaceitUtils.calculateBackoffDelay(attempt, baseDelay)
       console.warn(`Request failed, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries}):`, error)
-      await new Promise(resolve => setTimeout(resolve, delay))
+        await this.delay(delay)
+      }
     }
-  }
+    
+    return { success: false, data: null, error: 'Max retries exceeded' }
 }
 
-// Open API request wrapper with enhanced rate limiting
-async function openApiRequest(path: string, options: RequestInit = {}): Promise<any> {
-  if (!validateConfig()) {
-    throw new Error('FACEIT API Key not configured')
-  }
-
-  const url = `${FACEIT_CONFIG.OPEN_API_BASE_URL}${path}`
-  const requestOptions = {
-    headers: {
-      'Authorization': `Bearer ${FACEIT_CONFIG.API_KEY}`,
-      'Accept': 'application/json',
-      ...options.headers,
-    },
-    ...options,
-  }
-
-  return makeRequestWithRetry(url, requestOptions, 5, 1000)
-}
-
-// Modern fetch wrapper with enhanced retry logic (Legacy API)
-async function faceitApiRequest(path: string, options: RequestInit = {}): Promise<any> {
+  /**
+   * Make legacy FACEIT API request
+   */
+  static async legacyApiRequest<T>(path: string, options: RequestInit = {}): Promise<ApiResponse<T>> {
   const url = `${FACEIT_API_BASE_URL}${path}`
   const requestOptions = {
     credentials: 'include' as const,
@@ -289,327 +240,133 @@ async function faceitApiRequest(path: string, options: RequestInit = {}): Promis
     ...options,
   }
 
-  const data = await makeRequestWithRetry(url, requestOptions, 5, 1000)
+    const response = await this.request<any>(url, requestOptions)
   
-  if (!data) return null
+    if (!response.success || !response.data) {
+      return response
+    }
   
   // Handle FACEIT API response format
-  const { result, code, payload } = data
+    const { result, code, payload } = response.data
   if (
     (result && result.toUpperCase() !== 'OK') ||
     (code && code.toUpperCase() !== 'OPERATION-OK')
   ) {
-    throw new Error(`API Error: ${result || code}`)
-  }
-
-  return payload || data
-}
-
-// Utility functions
-function camelCaseKeys(obj: any): any {
-  if (Array.isArray(obj)) {
-    return obj.map(camelCaseKeys)
-  }
-  
-  if (obj !== null && typeof obj === 'object') {
-    const result: any = {}
-    for (const [key, value] of Object.entries(obj)) {
-      const camelKey = key.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase())
-      result[camelKey] = camelCaseKeys(value)
-    }
-    return result
-  }
-  
-  return obj
-}
-
-function isSupportedGame(game: string): boolean {
-  return SUPPORTED_GAMES.has(game.toLowerCase())
-}
-
-// Main API functions
-export async function getUser(userId: string): Promise<FaceitUser | null> {
-  const cache = FaceitApiCache.getInstance()
-  const cacheKey = `user:${userId}`
-  
-  const cached = await cache.get(cacheKey)
-  if (cached) return cached
-
-  try {
-    const data = await faceitApiRequest(`/users/v1/users/${userId}`)
-    if (!data) return null
-    
-    const user = camelCaseKeys(data)
-    
-    // Ensure userId is set from id field if not present
-    if (user.id && !user.userId) {
-      user.userId = user.id
-    }
-    
-    await cache.set(cacheKey, user)
-    return user
-  } catch (error) {
-    console.error('Failed to fetch user:', error)
-    return null
-  }
-}
-
-export async function getPlayer(nickname: string): Promise<FaceitUser | null> {
-  const cache = FaceitApiCache.getInstance()
-  const cacheKey = `player:${nickname}`
-  
-  const cached = await cache.get(cacheKey)
-  if (cached) {
-    console.log(`Using cached player data for: ${nickname}`)
-    return cached
-  }
-
-  try {
-    console.log(`Fetching player data for: ${nickname}`)
-    
-    // Try Open API first
-    try {
-      const openApiData = await openApiRequest(`/players?nickname=${encodeURIComponent(nickname)}`)
-      if (openApiData && openApiData.player_id) {
-        console.log(`Open API player data for ${nickname}:`, openApiData)
-        
-        const player: FaceitUser = {
-          userId: openApiData.player_id,
-          nickname: openApiData.nickname,
-          avatar: openApiData.avatar,
-          country: openApiData.country,
-          level: openApiData.skill_level,
-          id: openApiData.player_id
-        }
-        
-        console.log(`Final player object from Open API:`, player)
-        await cache.set(cacheKey, player)
-        return player
+      return { 
+        success: false, 
+        data: null, 
+        error: `API Error: ${result || code}` 
       }
-    } catch (openApiError) {
-      console.warn(`Open API failed for ${nickname}, trying legacy API:`, openApiError)
+  }
+
+    return { success: true, data: (payload || response.data) as T }
+}
+
+  static delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms))
     }
-    
-    // Fallback to legacy API
-    const data = await faceitApiRequest(`/users/v1/nicknames/${nickname}`)
-    if (!data) {
-      console.log(`No data returned for player: ${nickname}`)
-      return null
+}
+
+// ============================================================================
+// CACHE SERVICE
+// ============================================================================
+
+/**
+ * Enhanced cache service with type safety
+ */
+export class FaceitCacheService {
+  private static instance: FaceitCacheService
+  private readonly memoryCache = new Map<string, CacheEntry<unknown>>()
+
+  static getInstance(): FaceitCacheService {
+    if (!FaceitCacheService.instance) {
+      FaceitCacheService.instance = new FaceitCacheService()
     }
-    
-    const player = camelCaseKeys(data)
-    console.log(`Player data for ${nickname}:`, player)
-    console.log(`Player id field:`, player.id)
-    console.log(`Player userId field:`, player.userId)
-    
-    // Ensure userId is set from id field if not present
-    if (player.id && !player.userId) {
-      player.userId = player.id
-      console.log(`Set userId from id: ${player.userId}`)
+    return FaceitCacheService.instance
+  }
+
+  async get<T>(key: string): Promise<T | null> {
+    // Check memory cache first (fastest)
+    const memoryCached = this.memoryCache.get(key)
+    if (memoryCached && Date.now() - memoryCached.timestamp < CACHE_TIME) {
+      return memoryCached.data as T
     }
-    
-    console.log(`Final player object:`, player)
-    await cache.set(cacheKey, player)
-    return player
-  } catch (error) {
-    console.error('Failed to fetch player:', error)
+
+    // Check storage cache using new system
+    const cached = await getFromCache(key)
+    if (cached) {
+      // Update memory cache
+      this.memoryCache.set(key, { data: cached, timestamp: Date.now() })
+      return cached as T
+    }
+
     return null
+  }
+
+  async set<T>(key: string, data: T): Promise<void> {
+    const cacheEntry: CacheEntry<T> = { data, timestamp: Date.now() }
+    
+    // Update memory cache
+    this.memoryCache.set(key, cacheEntry)
+    
+    // Determine cache type and save to storage
+    const cacheType = FaceitUtils.getCacheType(key)
+    await saveToCache(key, data, cacheType)
+  }
+
+  async clear(): Promise<void> {
+    this.memoryCache.clear()
+    }
+    
+  async getCacheInfo(): Promise<{ memorySize: number; storageSize?: number }> {
+    const memorySize = this.memoryCache.size
+    return { memorySize }
   }
 }
 
-export async function getPlayerStats(userId: string, game: string = 'cs2', size: number = 20): Promise<PlayerStats | null> {
-  if (!isSupportedGame(game)) {
-    console.warn(`Unsupported game: ${game}`)
-    return null
-  }
+// ============================================================================
+// DATA PROCESSORS
+// ============================================================================
 
-  const cache = FaceitApiCache.getInstance()
-  const cacheKey = `stats:${userId}:${game}:${size}`
-  
-  const cached = await cache.get(cacheKey)
-  if (cached) return cached
-
-  try {
-    // Try Open API first
-    try {
-      const openApiStats = await openApiRequest(`/players/${userId}/games/${game}/stats`)
-      if (openApiStats && openApiStats.lifetime) {
-        console.log(`Open API stats for ${userId}:`, openApiStats)
-        
-        const stats = calculatePlayerStatsFromOpenApi(openApiStats.lifetime)
-        await cache.set(cacheKey, stats)
-        return stats
-      }
-    } catch (openApiError) {
-      console.warn(`Open API stats failed for ${userId}, trying legacy API:`, openApiError)
+/**
+ * Service for processing player statistics
+ */
+export class PlayerStatsProcessor {
+  /**
+   * Calculate player stats from legacy API data
+   */
+  static calculateFromLegacyApi(lifetimeStats: any, matches: any[]): PlayerStats {
+    const totalMatches = lifetimeStats.m1 || 0
+    
+    if (matches.length === 0) {
+      return this.createEmptyStats(totalMatches)
     }
     
-    // Fallback to legacy API - fetch total and average stats in parallel
-    const [totalStatsData, averageStatsData] = await Promise.allSettled([
-      faceitApiRequest(`/stats/v1/stats/users/${userId}/games/${game}`),
-      faceitApiRequest(`/stats/v1/stats/time/users/${userId}/games/${game}?size=${size}`)
-    ])
-
-    // Check if both requests succeeded
-    if (totalStatsData.status !== 'fulfilled' || !totalStatsData.value || Object.keys(totalStatsData.value).length === 0) {
-      console.log(`Total stats failed for ${userId}`)
-      return null
-    }
-
-    if (averageStatsData.status !== 'fulfilled' || !averageStatsData.value || !Array.isArray(averageStatsData.value)) {
-      console.log(`Average stats failed for ${userId}`)
-      return null
-    }
-
-    // Filter 5v5 matches
-    const fiveVFiveMatches = averageStatsData.value.filter((stats: any) => 
-      stats.gameMode && stats.gameMode.includes('5v5')
-    )
-
-    if (fiveVFiveMatches.length <= 1) {
-      return null
-    }
-
-    // Calculate stats
-    const stats = calculatePlayerStats(totalStatsData.value.lifetime, fiveVFiveMatches)
-    await cache.set(cacheKey, stats)
-    return stats
-  } catch (error) {
-    console.error('Failed to fetch player stats:', error)
-    return null
-  }
-}
-
-export async function getMatch(matchId: string): Promise<FaceitMatch | null> {
-  const cache = FaceitApiCache.getInstance()
-  const cacheKey = `match:${matchId}`
-  
-  const cached = await cache.get(cacheKey)
-  if (cached) return cached
-
-  try {
-    const data = await faceitApiRequest(`/match/v2/match/${matchId}`)
-    if (!data) return null
+    // Calculate win rate from match results
+    const wins = matches.filter(match => {
+      const matchResult = match.result || match.i10
+      return matchResult === '1' || matchResult === 1
+    }).length
     
-    const match = camelCaseKeys(data)
-    await cache.set(cacheKey, match)
-    return match
-  } catch (error) {
-    console.error('Failed to fetch match:', error)
-    return null
-  }
-}
-
-export async function getPlayerHistory(userId: string, page: number = 0): Promise<MatchHistory | null> {
-  const cache = FaceitApiCache.getInstance()
-  const cacheKey = `history:${userId}:${page}`
-  
-  const cached = await cache.get(cacheKey)
-  if (cached) return cached
-
-  try {
-    // Use stats API with user cookies for authentication
-    const size = 30
-    const to = Date.now() // Current timestamp in milliseconds
+    const winRate = Math.round((wins / matches.length) * 100)
     
-    console.log(`Fetching player stats history for ${userId} with size=${size}`)
-
-    try {
-      const data = await faceitApiRequest(
-        `/stats/v1/stats/time/users/${userId}/games/cs2?size=${size}&to=${to}`
-      )
-      
-      if (!data || !Array.isArray(data)) {
-        console.log(`No stats history data returned for player: ${userId}`)
-        return null
-      }
-      
-      console.log(`Raw history data for ${userId}:`, data)
-      
-      // Convert stats data to match history format with proper timestamps
-      const history = {
-        items: data.map((match: any, index: number) => {
-          // Try to extract real timestamp from various possible fields
-          let timestamp = null
-          
-          // Check for common timestamp fields
-          if (match.timestamp) {
-            timestamp = parseInt(match.timestamp)
-          } else if (match.date) {
-            timestamp = new Date(match.date).getTime()
-          } else if (match.createdAt) {
-            timestamp = new Date(match.createdAt).getTime()
-          } else if (match.matchDate) {
-            timestamp = new Date(match.matchDate).getTime()
-          } else if (match.matchId && match.matchId.includes('-')) {
-            // Try to extract timestamp from matchId if it's in timestamp format
-            const parts = match.matchId.split('-')
-            if (parts.length > 0) {
-              const possibleTimestamp = parseInt(parts[0])
-              if (!isNaN(possibleTimestamp) && possibleTimestamp > 1000000000000) {
-                timestamp = possibleTimestamp
-              }
-            }
-          }
-          
-          // If no timestamp found, estimate based on current time and index
-          // (assuming matches are ordered by date, newest first)
-          if (!timestamp) {
-            const now = Date.now()
-            const estimatedDaysAgo = index * 2 // Assume 2 days between matches
-            timestamp = now - (estimatedDaysAgo * 24 * 60 * 60 * 1000)
-          }
-          
-          return {
-            matchId: match.matchId || `estimated-${timestamp}-${index}`,
-            gameId: 'cs2',
-            nickname: match.nickname || 'Unknown',
-            i1: match.map || 'Unknown',
-            i2: match.teamId || '0',
-            i10: match.result || '0', // 1 = win, 0 = loss
-            timestamp: timestamp // Add timestamp for age calculation
-          }
-        })
-      }
-      
-      console.log(`Converted ${history.items.length} stats matches to history for ${userId}`)
-      console.log(`History items with timestamps:`, history.items.map(item => ({
-        matchId: item.matchId,
-        timestamp: item.timestamp,
-        date: new Date(item.timestamp).toISOString()
-      })))
-      
-      await cache.set(cacheKey, history)
-      return history
-    } catch (apiError) {
-      console.log(`Stats history API failed for ${userId}:`, apiError)
-      return null
-    }
-  } catch (error) {
-    console.error('Failed to fetch player history:', error)
-    // Don't throw, just return null - history is optional for smurf detection
-    return null
-  }
-}
-
-// Helper functions
-function calculatePlayerStats(lifetimeStats: any, matches: any[]): PlayerStats {
-  console.log('Calculating player stats from API data:')
-  console.log('Lifetime stats:', lifetimeStats)
-  console.log('Matches data:', matches)
-  
-  // Log first match to see all available fields
-  if (matches.length > 0) {
-    console.log('First match fields:', Object.keys(matches[0]))
-    console.log('First match data:', matches[0])
-  }
-  
-  const totalMatches = lifetimeStats.m1 || 0
-  
-  if (matches.length === 0) {
-    console.log('No matches data available')
+    // Calculate averages from matches
+    const stats = this.calculateAveragesFromMatches(matches)
+    
     return {
       matches: totalMatches,
+      averageKDRatio: stats.averageKDRatio,
+      averageKRRatio: stats.averageKRRatio,
+      averageHeadshots: stats.averageHeadshots,
+      averageKills: stats.averageKills,
+      averageADR: stats.averageADR,
+      winRate
+    }
+  }
+
+  private static createEmptyStats(matches: number): PlayerStats {
+    return {
+      matches,
       averageKDRatio: 0,
       averageKRRatio: 0,
       averageHeadshots: 0,
@@ -619,17 +376,13 @@ function calculatePlayerStats(lifetimeStats: any, matches: any[]): PlayerStats {
     }
   }
   
-  // Calculate win rate from match results
-  const wins = matches.filter(match => {
-    // Check if player's team won (i2 is player's team, result indicates win/loss)
-    const playerTeam = match.i2
-    const matchResult = match.result || match.i10
-    return matchResult === '1' || matchResult === 1
-  }).length
-  
-  const winRate = Math.round((wins / matches.length) * 100)
-  
-  // Calculate averages from matches using correct field mappings
+  private static calculateAveragesFromMatches(matches: any[]): {
+    averageKDRatio: number
+    averageKRRatio: number
+    averageHeadshots: number
+    averageKills: number
+    averageADR: number
+  } {
   const totalKills = matches.reduce((sum, match) => sum + (parseInt(match.i6) || 0), 0)
   const totalDeaths = matches.reduce((sum, match) => sum + (parseInt(match.i7) || 0), 0)
   const totalHeadshots = matches.reduce((sum, match) => sum + (parseInt(match.c4) || 0), 0)
@@ -644,24 +397,31 @@ function calculatePlayerStats(lifetimeStats: any, matches: any[]): PlayerStats {
     
   const averageKRRatio = krRatios.length > 0
     ? Number((krRatios.reduce((sum, kr) => sum + kr, 0) / krRatios.length).toFixed(2))
-    : averageKDRatio // Fallback to K/D if K/R not available
+      : averageKDRatio
     
   const averageKills = Math.round(totalKills / matches.length)
   const averageHeadshots = Math.round(totalHeadshots / matches.length)
   
-  // Try to calculate ADR from match data
-  let averageADR = 0
+    // Calculate ADR from match data
+    const averageADR = this.calculateAverageADR(matches)
+    
+    return {
+      averageKDRatio,
+      averageKRRatio,
+      averageHeadshots,
+      averageKills,
+      averageADR
+    }
+  }
+
+  private static calculateAverageADR(matches: any[]): number {
   const damageFields = ['damage', 'dmg', 'adr', 'i8', 'i9', 'c5', 'c6', 'c7', 'c8', 'c9']
   const damageMatches = matches.filter(match => {
-    for (const field of damageFields) {
-      if (match[field] && !isNaN(parseFloat(match[field]))) {
-        return true
-      }
-    }
-    return false
+      return damageFields.some(field => match[field] && !isNaN(parseFloat(match[field])))
   })
   
-  if (damageMatches.length > 0) {
+    if (damageMatches.length === 0) return 0
+    
     const totalDamage = damageMatches.reduce((sum, match) => {
       for (const field of damageFields) {
         const damage = parseFloat(match[field])
@@ -671,145 +431,365 @@ function calculatePlayerStats(lifetimeStats: any, matches: any[]): PlayerStats {
       }
       return sum
     }, 0)
-    averageADR = Math.round(totalDamage / damageMatches.length)
-    console.log(`Calculated ADR from ${damageMatches.length} matches: ${averageADR}`)
-  } else {
-    console.log('No damage data found in matches')
-  }
-  
-  const stats = {
-    matches: totalMatches,
-    averageKDRatio,
-    averageKRRatio,
-    averageHeadshots,
-    averageKills,
-    averageADR,
-    winRate
-  }
-  
-  console.log('Calculated stats:', stats)
-  return stats
-}
-
-// Helper function for Open API stats
-function calculatePlayerStatsFromOpenApi(lifetimeStats: any): PlayerStats {
-  console.log('Available lifetime stats fields:', Object.keys(lifetimeStats))
-  console.log('Lifetime stats values:', lifetimeStats)
-  
-  const matches = parseInt(lifetimeStats['Matches'] || lifetimeStats['Total Matches'] || '0')
-  const kdRatio = parseFloat(lifetimeStats['Average K/D Ratio'] || lifetimeStats['K/D Ratio'] || '0')
-  const krRatio = parseFloat(lifetimeStats['Average K/R Ratio'] || '0') || kdRatio // Use K/R if available, fallback to K/D
-  const winRate = parseInt(lifetimeStats['Win Rate %'] || '0')
-  const averageKills = parseFloat(lifetimeStats['Average Kills'] || '0')
-  const averageHeadshots = parseFloat(lifetimeStats['Average Headshots %'] || '0')
-  
-  // Try to get ADR from different possible fields
-  const averageADR = parseFloat(lifetimeStats['Average ADR'] || lifetimeStats['ADR'] || lifetimeStats['Average Damage'] || lifetimeStats['Damage'] || '0')
-  
-  console.log('Parsed stats:', {
-    matches,
-    kdRatio,
-    krRatio,
-    winRate,
-    averageKills,
-    averageHeadshots,
-    averageADR
-  })
-
-  return {
-    matches: matches,
-    averageKDRatio: kdRatio,
-    averageKRRatio: krRatio,
-    averageHeadshots: Math.round(averageHeadshots),
-    averageKills: Math.round(averageKills),
-    averageADR: Math.round(averageADR),
-    winRate: winRate
-  }
-}
-
-// New function for parallel player data fetching
-export async function getPlayerDataParallel(nickname: string): Promise<{
-  player: FaceitUser | null
-  stats: PlayerStats | null
-  history: MatchHistory | null
-} | null> {
-  try {
-    console.log(`Fetching player data in parallel for: ${nickname}`)
     
-    // Get player info first (needed for other requests)
-    const player = await getPlayer(nickname)
-    if (!player) {
-      console.log(`Player not found: ${nickname}`)
-      return null
-    }
+    return Math.round(totalDamage / damageMatches.length)
+  }
+}
 
-    console.log(`Found player: ${nickname}, userId: ${player.userId}`)
-
-    // Fetch stats and history in parallel
-    const [stats, history] = await Promise.allSettled([
-      getPlayerStats(player.userId, 'cs2', 20),
-      getPlayerHistory(player.userId, 0)
-    ])
-
+/**
+ * Service for processing match history
+ */
+export class MatchHistoryProcessor {
+  /**
+   * Convert stats data to match history format
+   */
+  static convertFromStatsData(data: any[]): MatchHistory {
     return {
-      player,
-      stats: stats.status === 'fulfilled' ? stats.value : null,
-      history: history.status === 'fulfilled' ? history.value : null
+      items: data.map((match: any, index: number) => {
+        const timestamp = this.extractTimestamp(match, index)
+        
+        return {
+          matchId: match.matchId || `estimated-${timestamp}-${index}`,
+          gameId: 'cs2',
+          nickname: match.nickname || 'Unknown',
+          i1: match.map || 'Unknown',
+          i2: match.teamId || '0',
+          i10: match.result || '0',
+          timestamp
+        }
+      })
     }
-  } catch (error) {
-    console.error(`Failed to fetch player data for ${nickname}:`, error)
-    return null
-  }
-}
-
-// New function for parallel batch processing
-export async function getMultiplePlayersDataParallel(nicknames: string[]): Promise<Map<string, {
-  player: FaceitUser | null
-  stats: PlayerStats | null
-  history: MatchHistory | null
-}>> {
-  console.log(`Fetching data for ${nicknames.length} players in parallel`)
-  
-  const results = new Map<string, {
-    player: FaceitUser | null
-    stats: PlayerStats | null
-    history: MatchHistory | null
-  }>()
-
-  // Process players in batches to avoid overwhelming the API
-  const batchSize = 3 // Process 3 players at a time
-  const batches = []
-  
-  for (let i = 0; i < nicknames.length; i += batchSize) {
-    batches.push(nicknames.slice(i, i + batchSize))
   }
 
-  for (const batch of batches) {
-    const batchPromises = batch.map(async (nickname) => {
-      const data = await getPlayerDataParallel(nickname)
-      return { nickname, data }
-    })
-
-    const batchResults = await Promise.allSettled(batchPromises)
+  private static extractTimestamp(match: any, index: number): number {
+    // Try to extract real timestamp from various possible fields
+    if (match.timestamp) {
+      return parseInt(match.timestamp)
+    }
     
-    for (const result of batchResults) {
-      if (result.status === 'fulfilled') {
-        const { nickname, data } = result.value
-        if (data) {
-          results.set(nickname, data)
+    if (match.date) {
+      return new Date(match.date).getTime()
+    }
+    
+    if (match.createdAt) {
+      return new Date(match.createdAt).getTime()
+    }
+    
+    if (match.matchDate) {
+      return new Date(match.matchDate).getTime()
+    }
+    
+    if (match.matchId && match.matchId.includes('-')) {
+      const parts = match.matchId.split('-')
+      if (parts.length > 0) {
+        const possibleTimestamp = parseInt(parts[0])
+        if (!isNaN(possibleTimestamp) && possibleTimestamp > 1000000000000) {
+          return possibleTimestamp
         }
       }
     }
+    
+    // Estimate timestamp based on current time and index
+    const now = Date.now()
+    const estimatedDaysAgo = index * 2 // Assume 2 days between matches
+    return now - (estimatedDaysAgo * 24 * 60 * 60 * 1000)
+  }
+}
 
-    // Small delay between batches to respect rate limits
-    if (batches.length > 1) {
-      await new Promise(resolve => setTimeout(resolve, 200))
+// ============================================================================
+// API SERVICES
+// ============================================================================
+
+/**
+ * Service for user-related API operations
+ */
+export class UserApiService {
+  private static readonly cache = FaceitCacheService.getInstance()
+
+  /**
+   * Get user by ID
+   */
+  static async getUser(userId: string): Promise<FaceitUser | null> {
+    const cacheKey = `user:${userId}`
+    
+    const cached = await this.cache.get<FaceitUser>(cacheKey)
+    if (cached) return cached
+
+    try {
+      const response = await FaceitHttpClient.legacyApiRequest<any>(`/users/v1/users/${userId}`)
+      if (!response.success || !response.data) return null
+      
+      const user = FaceitUtils.camelCaseKeys(response.data)
+      FaceitUtils.ensureUserId(user)
+      
+      await this.cache.set(cacheKey, user)
+      return user
+    } catch (error) {
+      console.error('Failed to fetch user:', error)
+      return null
     }
   }
 
-  console.log(`Successfully fetched data for ${results.size} out of ${nicknames.length} players`)
-  return results
+  /**
+   * Get player by nickname
+   */
+  static async getPlayer(nickname: string): Promise<FaceitUser | null> {
+    const cacheKey = `player:${nickname}`
+    
+    const cached = await this.cache.get<FaceitUser>(cacheKey)
+    if (cached) {
+      return cached
+    }
+
+    try {
+      const response = await FaceitHttpClient.legacyApiRequest<any>(`/users/v1/nicknames/${nickname}`)
+      if (!response.success || !response.data) {
+        return null
+      }
+      
+      const player = FaceitUtils.camelCaseKeys(response.data)
+      FaceitUtils.ensureUserId(player)
+      await this.cache.set(cacheKey, player)
+      return player
+    } catch (error) {
+      return null
+    }
+  }
 }
 
-// Export constants
-export { SUPPORTED_GAMES, isSupportedGame } 
+/**
+ * Service for statistics-related API operations
+ */
+export class StatsApiService {
+  private static readonly cache = FaceitCacheService.getInstance()
+
+  /**
+   * Get player statistics
+   */
+  static async getPlayerStats(userId: string, game: string = 'cs2', size: number = 20): Promise<PlayerStats | null> {
+    if (!FaceitUtils.isSupportedGame(game)) {
+      console.warn(`Unsupported game: ${game}`)
+      return null
+    }
+
+    const cacheKey = `stats:${userId}:${game}:${size}`
+    
+    const cached = await this.cache.get<PlayerStats>(cacheKey)
+    if (cached) return cached
+
+    try {
+      const legacyStats = await this.getLegacyStats(userId, game, size)
+      if (legacyStats) {
+        await this.cache.set(cacheKey, legacyStats)
+        return legacyStats
+      }
+      
+      return null
+    } catch (error) {
+      console.error('Failed to fetch player stats:', error)
+      return null
+    }
+  }
+
+  private static async getLegacyStats(userId: string, game: string, size: number): Promise<PlayerStats | null> {
+    const [totalStatsResponse, averageStatsResponse] = await Promise.allSettled([
+      FaceitHttpClient.legacyApiRequest<any>(`/stats/v1/stats/users/${userId}/games/${game}`),
+      FaceitHttpClient.legacyApiRequest<any>(`/stats/v1/stats/time/users/${userId}/games/${game}?size=${size}`)
+    ])
+
+    if (totalStatsResponse.status !== 'fulfilled' || 
+        !totalStatsResponse.value.success || 
+        !totalStatsResponse.value.data || 
+        Object.keys(totalStatsResponse.value.data).length === 0) {
+      return null
+    }
+
+    if (averageStatsResponse.status !== 'fulfilled' || 
+        !averageStatsResponse.value.success || 
+        !averageStatsResponse.value.data || 
+        !Array.isArray(averageStatsResponse.value.data)) {
+      return null
+    }
+
+    // Filter 5v5 matches
+    const fiveVFiveMatches = averageStatsResponse.value.data.filter((stats: any) => 
+      stats.gameMode && stats.gameMode.includes('5v5')
+    )
+
+    if (fiveVFiveMatches.length <= 1) {
+      return null
+    }
+
+    return PlayerStatsProcessor.calculateFromLegacyApi(
+      totalStatsResponse.value.data.lifetime, 
+      fiveVFiveMatches
+    )
+  }
+}
+
+/**
+ * Service for match-related API operations
+ */
+export class MatchApiService {
+  private static readonly cache = FaceitCacheService.getInstance()
+
+  /**
+   * Get match by ID
+   */
+  static async getMatch(matchId: string): Promise<FaceitMatch | null> {
+    const cacheKey = `match:${matchId}`
+    
+    const cached = await this.cache.get<FaceitMatch>(cacheKey)
+    if (cached) return cached
+
+    try {
+      const response = await FaceitHttpClient.legacyApiRequest<any>(`/match/v2/match/${matchId}`)
+      if (!response.success || !response.data) return null
+      
+      const match = FaceitUtils.camelCaseKeys(response.data)
+      await this.cache.set(cacheKey, match)
+      return match
+    } catch (error) {
+      console.error('Failed to fetch match:', error)
+      return null
+    }
+  }
+
+  /**
+   * Get player match history
+   */
+  static async getPlayerHistory(userId: string, page: number = 0): Promise<MatchHistory | null> {
+    const cacheKey = `history:${userId}:${page}`
+    
+    const cached = await this.cache.get<MatchHistory>(cacheKey)
+    if (cached) return cached
+
+    try {
+      const size = 30
+      const to = Date.now()
+      
+      const response = await FaceitHttpClient.legacyApiRequest<any>(
+        `/stats/v1/stats/time/users/${userId}/games/cs2?size=${size}&to=${to}`
+      )
+      
+      if (!response.success || !response.data || !Array.isArray(response.data)) {
+        return null
+      }
+
+      const history = MatchHistoryProcessor.convertFromStatsData(response.data)
+      await this.cache.set(cacheKey, history)
+      return history
+    } catch (error) {
+      console.error('Failed to fetch player history:', error)
+      return null
+    }
+  }
+}
+
+// ============================================================================
+// BATCH PROCESSING SERVICE
+// ============================================================================
+
+/**
+ * Service for batch processing operations
+ */
+export class BatchProcessingService {
+  /**
+   * Get complete player data (player info, stats, history)
+   */
+  static async getPlayerDataParallel(nickname: string): Promise<PlayerData | null> {
+    try {
+      
+      // Get player info first (needed for other requests)
+      const player = await UserApiService.getPlayer(nickname)
+      if (!player) {
+        return null
+      }
+      
+
+      // Fetch stats and history in parallel
+      const [stats, history] = await Promise.allSettled([
+          StatsApiService.getPlayerStats(player.userId, 'cs2', 20),
+          MatchApiService.getPlayerHistory(player.userId, 0)
+      ])
+
+      const statsResult = stats.status === 'fulfilled' ? stats.value : null
+      const historyResult = history.status === 'fulfilled' ? history.value : null
+      
+      return {
+        player,
+        stats: statsResult,
+        history: historyResult
+      }
+    } catch (error) {
+      return null
+    }
+  }
+
+  /**
+   * Get data for multiple players in parallel
+   */
+  static async getMultiplePlayersDataParallel(nicknames: string[]): Promise<Map<string, PlayerData>> {
+    const results = new Map<string, PlayerData>() 
+
+    // Process players in batches to avoid overwhelming the API
+    const batches = BatchProcessingService.createBatches(nicknames, BATCH_SIZE)
+
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+      const batch = batches[batchIndex]
+      
+      const batchPromises = batch.map(async (nickname) => {
+        const data = await BatchProcessingService.getPlayerDataParallel(nickname)
+        return { nickname, data }
+      })
+
+      const batchResults = await Promise.allSettled(batchPromises)
+      
+      for (const result of batchResults) {
+        if (result.status === 'fulfilled') {
+          const { nickname, data } = result.value
+          if (data) {
+            results.set(nickname, data)
+          }
+        } else {
+        }
+      }
+
+      // Small delay between batches to respect rate limits
+      if (batches.length > 1) {
+        await BatchProcessingService.delay(200)
+      }
+    }
+
+    return results
+  }
+
+  static createBatches<T>(items: T[], batchSize: number): T[][] {
+    const batches: T[][] = []
+    for (let i = 0; i < items.length; i += batchSize) {
+      batches.push(items.slice(i, i + batchSize))
+    }
+    return batches
+  }
+
+  static delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms))
+  }
+}
+
+// ============================================================================
+// PUBLIC API EXPORTS
+// ============================================================================
+
+// Main API functions (legacy exports for backward compatibility)
+export const getUser = UserApiService.getUser
+export const getPlayer = UserApiService.getPlayer
+export const getPlayerStats = StatsApiService.getPlayerStats
+export const getMatch = MatchApiService.getMatch
+export const getPlayerHistory = MatchApiService.getPlayerHistory
+export const getPlayerDataParallel = BatchProcessingService.getPlayerDataParallel
+export const getMultiplePlayersDataParallel = BatchProcessingService.getMultiplePlayersDataParallel
+
+// Utility exports
+export const isSupportedGame = FaceitUtils.isSupportedGame
+export { SUPPORTED_GAMES } 

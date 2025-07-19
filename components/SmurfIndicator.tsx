@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react'
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover'
 import { Badge } from './ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card'
+import { useI18n } from '../hooks/use-i18n'
 
 interface PlayerStats {
   matches: number
@@ -21,6 +22,7 @@ interface SmurfIndicatorProps {
 }
 
 export function SmurfIndicator({ nickname, confidence, reasons, stats }: SmurfIndicatorProps) {
+  const { t, loading } = useI18n()
   const containerRef = useRef<HTMLDivElement>(null)
   const [isOpen, setIsOpen] = useState(false)
   const timeoutRef = useRef<NodeJS.Timeout | undefined>(undefined)
@@ -53,6 +55,11 @@ export function SmurfIndicator({ nickname, confidence, reasons, stats }: SmurfIn
   const confidenceVariant = confidence >= 70 ? 'destructive' : 
                            confidence >= 50 ? 'default' : 'secondary'
 
+  // Не показываем компонент пока не загрузятся настройки
+  if (loading) {
+    return null
+  }
+
   return (
     <div ref={containerRef} className="relative">
       <Popover open={isOpen} onOpenChange={setIsOpen}>
@@ -65,7 +72,7 @@ export function SmurfIndicator({ nickname, confidence, reasons, stats }: SmurfIn
               variant={confidenceVariant}
               className="cursor-pointer hover:opacity-80 transition-opacity text-xs font-bold px-2 py-1 rounded"
             >
-              SMURF {confidence}%
+              {t('smurf')} {confidence}%
             </Badge>
           </div>
         </PopoverTrigger>

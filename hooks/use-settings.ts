@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { appearanceSettings, systemSettings, uiSettings, type AppearanceSettings, type SystemSettings, type UISettings, type Theme } from '../lib/storage'
+import { systemSettings, uiSettings, type SystemSettings, type UISettings } from '../lib/storage'
+import { getDefaultLanguage } from '../lib/i18n'
 
 // Re-export storage items for content script
 export { systemSettings }
@@ -33,12 +34,14 @@ export async function isFeatureEnabled(featureName: string): Promise<boolean> {
 
 // React hook for popup
 export function useSettings() {
-  const [appearance, setAppearance] = useState<AppearanceSettings>({ theme: 'system' })
+  // Инициализируем с английским языком по умолчанию
   const [system, setSystem] = useState<SystemSettings>({ 
     notifications: true, 
     syncInterval: 15, 
     enabled: true, 
-    smurfDetection: true 
+    smurfDetection: true,
+    hideCampaigns: false,
+    language: getDefaultLanguage()
   })
   const [ui, setUI] = useState<UISettings>({ activeTab: 'home' })
   const [loading, setLoading] = useState(true)
@@ -47,13 +50,17 @@ export function useSettings() {
   useEffect(() => {
     const loadSettings = async () => {
       try {
-        const [appearanceData, systemData, uiData] = await Promise.all([
-          appearanceSettings.getValue(),
+        const [systemData, uiData] = await Promise.all([
           systemSettings.getValue(),
           uiSettings.getValue()
         ])
         
-        setAppearance(appearanceData)
+        // Initialize language if not set (for existing users)
+        if (!systemData.language) {
+          systemData.language = getDefaultLanguage()
+          await systemSettings.setValue(systemData)
+        }
+        
         setSystem(systemData)
         setUI(uiData)
       } catch (error) {
@@ -66,25 +73,20 @@ export function useSettings() {
     loadSettings()
   }, [])
 
-  // Update appearance settings
-  const updateAppearance = async (updates: Partial<AppearanceSettings>) => {
-    const newSettings = { ...appearance, ...updates }
-    setAppearance(newSettings)
-    try {
-      await appearanceSettings.setValue(newSettings)
-    } catch (error) {
-      console.error('Failed to save appearance settings:', error)
-    }
-  }
-
   // Update system settings
   const updateSystem = async (updates: Partial<SystemSettings>) => {
     const newSettings = { ...system, ...updates }
+    
+    // Сначала обновляем локальное состояние синхронно
     setSystem(newSettings)
+    
+    // Затем сохраняем в storage асинхронно
     try {
       await systemSettings.setValue(newSettings)
     } catch (error) {
       console.error('Failed to save system settings:', error)
+      // В случае ошибки откатываем изменения
+      setSystem(system)
     }
   }
 
@@ -103,22 +105,21 @@ export function useSettings() {
   const resetSettings = async () => {
     try {
       await Promise.all([
-        appearanceSettings.removeValue(),
         systemSettings.removeValue(),
         uiSettings.removeValue()
       ])
       
       // Reset to default values
-      const defaultAppearance = { theme: 'system' as Theme }
       const defaultSystem = { 
         notifications: true, 
         syncInterval: 15, 
         enabled: true, 
-        smurfDetection: true 
+        smurfDetection: true,
+        hideCampaigns: false,
+        language: getDefaultLanguage()
       }
       const defaultUI = { activeTab: 'home' }
       
-      setAppearance(defaultAppearance)
       setSystem(defaultSystem)
       setUI(defaultUI)
     } catch (error) {
@@ -127,11 +128,9 @@ export function useSettings() {
   }
 
   return {
-    appearance,
     system,
     ui,
     loading,
-    updateAppearance,
     updateSystem,
     updateUI,
     resetSettings

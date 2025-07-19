@@ -1,8 +1,40 @@
+import React from 'react'
 import { getPlayer, getPlayerStats, getPlayerHistory, getMultiplePlayersDataParallel, type PlayerStats, type FaceitUser, type MatchHistory } from '../lib/faceit-api'
-import { getRoomId, findTeamContainers, findPlayerCards, extractNickname, select, selectAll } from '../lib/match-room'
+import { 
+  MatchRoomUtils, 
+  DomQueryService, 
+  FactionService, 
+  PartyColorService, 
+  MatchDataService 
+} from '../lib/match-room'
 import { setFeatureAttribute, hasFeatureAttribute, isFaceitNext } from '../lib/dom-element'
 import { renderReactComponent } from '../lib/react-renderer'
 import { SmurfIndicator } from '../components/SmurfIndicator'
+import { SmurfDetectionLoader } from '../components/SmurfDetectionLoader'
+import { SmurfDetectionHeaderLoader } from '../components/SmurfDetectionHeaderLoader'
+import { queryClient } from '../lib/react-query-provider'
+import { faceitQueryKeys } from '../hooks/use-faceit-api'
+import { saveToCache, getFromCache, clearCache } from '../lib/cache-sync'
+import { waitForPlayerCards } from '../lib/utils'
+
+// Function to check if current page is a match room (not scoreboard)
+function isMatchRoomPage(): boolean {
+  const currentUrl = window.location.href
+  
+  // Check for active match room
+  const matchRoomPattern = /^https:\/\/www\.faceit\.com\/[a-z]{2}\/cs2\/room\/[^\/]+$/
+  const isActiveRoom = matchRoomPattern.test(currentUrl)
+  
+  // Check for match results page (new support)
+  const matchResultsPattern = /^https:\/\/www\.faceit\.com\/[a-z]{2}\/cs2\/results\/[^\/]+$/
+  const isResultsPage = matchResultsPattern.test(currentUrl)
+  
+  // Check for any page with player cards (fallback)
+  const hasPlayerCards = document.querySelector('[type="button"][aria-haspopup="dialog"], [class*="ListContentPlayer__Holder"]')
+  const isPageWithPlayers = !!hasPlayerCards
+  
+  return isActiveRoom || isResultsPage || isPageWithPlayers
+}
 
 interface SmurfData {
   nickname: string
@@ -22,7 +54,7 @@ interface SmurfDetectionConfig {
 
 const DEFAULT_CONFIG: SmurfDetectionConfig = {
   minMatches: 50,        // Изменено: теперь игроки с <50 матчей считаются подозрительными
-  maxMatches: 1000,       
+  maxMatches: 2000,       
   minKDRatio: 1,       
   minWinRate: 55,        
   maxAccountAge: 365,     
@@ -39,30 +71,69 @@ class SmurfDetector {
 
   async analyzePlayer(nickname: string): Promise<SmurfData | null> {
     try {
-      console.log(`Analyzing player: ${nickname}`)
+      // Проверяем кеш storage
+      const playerCacheKey = `player:${nickname}`
+      let cachedPlayer = await getFromCache(playerCacheKey)
       
-      // Get player info
-      const player = await getPlayer(nickname)
+      let player: FaceitUser | null
+      if (cachedPlayer) {
+        player = cachedPlayer as FaceitUser
+      } else {
+        player = await getPlayer(nickname)
+        if (player) {
+          // Сохраняем в кеш storage
+          await saveToCache(playerCacheKey, player, 'player')
+          // Также сохраняем в React Query кеш
+          const playerQueryKey = faceitQueryKeys.player(nickname)
+          queryClient.setQueryData(playerQueryKey, player)
+        }
+      }
+      
       if (!player) {
-        console.log(`Player not found: ${nickname}`)
         return null
       }
 
-      console.log(`Found player: ${nickname}, userId: ${player.userId}`)
-
-      // Get player stats
-      const stats = await getPlayerStats(player.userId, 'cs2', 20)
+      // Проверяем кеш статистики
+      const statsCacheKey = `stats:${player.userId}:cs2:20`
+      let cachedStats = await getFromCache(statsCacheKey)
+      
+      let stats: PlayerStats | null
+      if (cachedStats) {
+        stats = cachedStats as PlayerStats
+      } else {
+        stats = await getPlayerStats(player.userId, 'cs2', 20)
+        if (stats) {
+          // Сохраняем в кеш storage
+          await saveToCache(statsCacheKey, stats, 'playerStats')
+          // Также сохраняем в React Query кеш
+          const statsQueryKey = faceitQueryKeys.playerStats(player.userId, 'cs2', 20)
+          queryClient.setQueryData(statsQueryKey, stats)
+        }
+      }
+      
       if (!stats) {
-        console.log(`No stats available for: ${nickname}`)
         return null
       }
 
-      // Get player history for account age analysis (optional)
+      // Проверяем кеш истории (опционально)
       let history = null
       try {
-        history = await getPlayerHistory(player.userId, 0)
+        const historyCacheKey = `history:${player.userId}:0`
+        let cachedHistory = await getFromCache(historyCacheKey)
+        
+        if (cachedHistory) {
+          history = cachedHistory as MatchHistory
+        } else {
+          history = await getPlayerHistory(player.userId, 0)
+          if (history) {
+            // Сохраняем в кеш storage
+            await saveToCache(historyCacheKey, history, 'playerHistory')
+            // Также сохраняем в React Query кеш
+            const historyQueryKey = faceitQueryKeys.playerHistory(player.userId, 0)
+            queryClient.setQueryData(historyQueryKey, history)
+          }
+        }
       } catch (error) {
-        console.log(`History not available for ${nickname} (FACEIT API limitation)`)
       }
       
       return this.calculateSmurfIndicator(nickname, player, stats, history)
@@ -72,7 +143,7 @@ class SmurfDetector {
     }
   }
 
-  // New method to analyze player with pre-fetched data
+  // Метод для анализа игрока с предзагруженными данными
   analyzePlayerWithData(
     nickname: string, 
     player: FaceitUser, 
@@ -80,41 +151,31 @@ class SmurfDetector {
     history: MatchHistory | null
   ): SmurfData | null {
     if (!stats) {
-      console.log(`No stats available for: ${nickname}`)
       return null
     }
 
-    return this.calculateSmurfIndicator(nickname, player, stats, history)
+    const result = this.calculateSmurfIndicator(nickname, player, stats, history)
+
+    
+    return result
   }
 
-  // Extract smurf calculation logic to reusable method
+  // Извлекаем логику расчета smurf индикатора в переиспользуемый метод
   private calculateSmurfIndicator(
     nickname: string, 
     player: FaceitUser, 
     stats: PlayerStats, 
     history: MatchHistory | null
   ): SmurfData | null {
-    console.log(`Analyzing smurf indicators for ${nickname}:`, { 
-      player: { 
-        nickname: player.nickname, 
-        level: player.level, 
-        userId: player.userId 
-      }, 
-      stats: {
-        matches: stats.matches,
-        averageKDRatio: stats.averageKDRatio,
-        averageKRRatio: stats.averageKRRatio,
-        winRate: stats.winRate,
-        averageKills: stats.averageKills,
-        averageHeadshots: stats.averageHeadshots
-      }
-    })
     
     const reasons: string[] = []
     let confidence = 0
 
     // Check match count (most important indicator)
-    if (stats.matches < 30) {
+    if (stats.matches > this.config.maxMatches) {
+      // Игроки с количеством матчей больше maxMatches полностью исключаются из анализа
+      return null
+    } else if (stats.matches < 30) {
       reasons.push(`Very low match count: ${stats.matches}`)
       confidence += 40 // Very high weight for very low match count
     } else if (stats.matches < 100) {
@@ -126,9 +187,6 @@ class SmurfDetector {
     } else if (stats.matches < 350) {
       reasons.push(`Average match count: ${stats.matches}`)
       confidence += 10 // Low weight for average match count
-    } else if (stats.matches > this.config.maxMatches) {
-      reasons.push(`High match count: ${stats.matches}`)
-      confidence += 5 // Reduced weight for high match count
     }
 
     // Check K/D ratio with ranges
@@ -205,40 +263,6 @@ class SmurfDetector {
       }
     }
 
-    // Check account age (if history available) - TEMPORARILY DISABLED
-    // if (history && history.items && history.items.length > 0) {
-    //   console.log(`Analyzing account age for ${nickname} with ${history.items.length} matches`)
-    //   
-    //   // Sort matches by timestamp (oldest first)
-    //   const sortedMatches = [...history.items].sort((a, b) => a.timestamp - b.timestamp)
-    //   const firstMatch = sortedMatches[0] // Oldest match
-    //   const lastMatch = sortedMatches[sortedMatches.length - 1] // Newest match
-    //   
-    //   console.log(`First match:`, firstMatch)
-    //   console.log(`Last match:`, lastMatch)
-    //   
-    //   if (firstMatch && lastMatch && firstMatch.timestamp && lastMatch.timestamp) {
-    //     const firstMatchDate = new Date(firstMatch.timestamp)
-    //     const lastMatchDate = new Date(lastMatch.timestamp)
-    //     const accountAge = (lastMatchDate.getTime() - firstMatchDate.getTime()) / (1000 * 60 * 60 * 24)
-    //     
-    //     console.log(`Account age calculation for ${nickname}:`)
-    //     console.log(`First match date: ${firstMatchDate.toISOString()}`)
-    //     console.log(`Last match date: ${lastMatchDate.toISOString()}`)
-    //     console.log(`Account age: ${accountAge} days`)
-    //     
-    //     if (accountAge < this.config.maxAccountAge) {
-    //       reasons.push(`New account: ${Math.round(accountAge)} days old`)
-    //       confidence += 20
-    //     }
-    //   } else {
-    //     console.log(`Missing timestamp data for ${nickname}`)
-    //   }
-    // } else {
-    //   // History not available - this is normal for FACEIT API
-    //   console.log(`Account age analysis skipped for ${nickname} (history unavailable)`)
-    // }
-
     // Additional checks for classic smurf patterns
     // Check if player has very high stats with low match count (classic smurf pattern)
     if (stats.matches < 30 && stats.averageKDRatio > 1.8 && stats.winRate > 70) {
@@ -247,18 +271,28 @@ class SmurfDetector {
     }
     
     // Check if player has very high K/R with low match count (another smurf indicator)
-    if (stats.matches < 30 && stats.averageKRRatio > 1.8) {
-      reasons.push(`High K/R ratio with low matches: ${stats.averageKRRatio}`)
+    if (stats.matches < 50 && stats.averageKRRatio > 1.5 && stats.winRate > 65) {
+      reasons.push(`High K/R with low matches: potential smurf`)
       confidence += 15
+    }
+
+    // Check if player has very high headshot percentage with low matches
+    if (stats.matches < 100 && stats.averageHeadshots > 60) {
+      reasons.push(`High headshot percentage: ${stats.averageHeadshots}%`)
+      confidence += 10
+    }
+
+    // Check if player has very high ADR with low matches
+    if (stats.matches < 100 && stats.averageADR > 100) {
+      reasons.push(`High ADR: ${stats.averageADR}`)
+      confidence += 10
     }
 
     // Cap confidence at 100%
     confidence = Math.min(confidence, 100)
 
-    console.log(`Smurf analysis for ${nickname}: confidence=${confidence}%, reasons:`, reasons)
-
-    // Only return if confidence is high enough and we have reasons
-    if (confidence >= 40 && reasons.length > 0) {
+    // Show smurf only if confidence is 50% or higher
+    if (confidence >= 51) {
       return {
         nickname,
         confidence,
@@ -270,303 +304,441 @@ class SmurfDetector {
     return null
   }
 
-  async detectSmurfsInMatch(): Promise<SmurfData[]> {
-    // Reset processed players for new match
-    this.processedPlayers.clear()
+    async detectSmurfsInMatch(): Promise<SmurfData[]> {
     
-    const roomId = getRoomId()
+    const roomId = MatchRoomUtils.getRoomId()
+    
     if (!roomId) {
-      console.log('No room ID found')
+      console.warn('No room ID found, but continuing with smurf detection...')
+    }
+
+    // Find team containers
+    const teamElements = DomQueryService.findTeamContainers(document.body)
+    if (!teamElements || teamElements.length === 0) {
+      console.warn('No team elements found, skipping smurf detection')
       return []
     }
 
-    // После ожидания загрузки контента, попробуем найти правильный root
-    const mainContent = select('#__next')
-    let teamContainers: Element[]
-    
-    if (!mainContent) {
-      console.log('Main content not found, trying document.body')
-      const mainContentFallback = document.body
-      if (!mainContentFallback) {
-        console.log('Neither #__next nor body found')
-        return []
-      }
-      console.log('Using document.body as main content')
-      teamContainers = findTeamContainers(mainContentFallback)
-    } else {
-      teamContainers = findTeamContainers(mainContent)
-    }
-    
-    // Если не нашли контейнеры в #__next, попробуем document.body
-    if (teamContainers.length === 0 && mainContent) {
-      console.log('No team containers found in #__next, trying document.body')
-      teamContainers = findTeamContainers(document.body)
-    }
-    
-    console.log('Found team containers:', teamContainers.length)
-    
-    // Collect all nicknames first
-    const nicknames: string[] = []
-    for (const teamContainer of teamContainers) {
-      const playerCards = findPlayerCards(teamContainer)
-      console.log('Found player cards in team:', playerCards.length)
-      
-      for (const playerCard of playerCards) {
-        const nickname = extractNickname(playerCard)
-        console.log('Extracted nickname:', nickname)
-        if (!nickname || this.processedPlayers.has(nickname)) continue
+    // Extract all player nicknames
+    const allNicknames: string[] = []
+    const processedNicknames = new Set<string>()
 
+    for (const teamElement of teamElements) {
+      const playerCards = DomQueryService.findPlayerCards(teamElement)
+
+      for (const card of playerCards) {
+        const nickname = DomQueryService.extractNickname(card)
+        if (nickname && !processedNicknames.has(nickname)) {
+          allNicknames.push(nickname)
+          processedNicknames.add(nickname)
+        }
+      }
+    }
+
+    if (allNicknames.length === 0) {
+      return []
+    }
+
+    // Use React Query for batch processing
+    try {
+      
+      // Получаем данные всех игроков параллельно
+      const playersData = await getMultiplePlayersDataParallel(allNicknames)
+      
+      // Анализируем каждого игрока
+      const smurfs: SmurfData[] = []
+      
+      for (const [nickname, data] of playersData) {
+        if (this.processedPlayers.has(nickname)) {
+          continue
+        }
+        
         this.processedPlayers.add(nickname)
-        nicknames.push(nickname)
+        
+        
+        
+        const smurfData = this.analyzePlayerWithData(
+          nickname, 
+          data.player!, 
+          data.stats, 
+          data.history
+        )
+        
+        if (smurfData) {
+          smurfs.push(smurfData)
+        }
       }
-    }
-
-    if (nicknames.length === 0) {
-      console.log('No players found to analyze')
+      
+      return smurfs
+      
+    } catch (error) {
       return []
     }
+  }
 
-    console.log(`Analyzing ${nicknames.length} players in parallel`)
-
-    // Fetch all player data in parallel
-    const playersData = await getMultiplePlayersDataParallel(nicknames)
-    
-    const smurfs: SmurfData[] = []
-
-    // Analyze each player with the fetched data
-    for (const nickname of nicknames) {
-      const data = playersData.get(nickname)
-      if (!data || !data.player || !data.stats) {
-        console.log(`No data available for ${nickname}`)
-        continue
+  // Функция для очистки React Query кеша
+  public clearReactQueryCache(type?: 'player' | 'playerStats' | 'playerHistory' | 'match' | 'multiplePlayers'): void {
+    try {
+      if (type) {
+        // Очищаем только определенный тип
+        const queries = queryClient.getQueryCache().getAll()
+        queries.forEach(query => {
+          const queryKey = query.queryKey
+          if (Array.isArray(queryKey) && queryKey[0] === 'faceit' && queryKey[1] === type) {
+            queryClient.removeQueries({ queryKey })
+          }
+        })    
+      } else {
+        // Очищаем весь React Query кеш
+        queryClient.clear()
       }
-
-      const smurfIndicator = this.analyzePlayerWithData(
-        nickname, 
-        data.player, 
-        data.stats, 
-        data.history
-      )
-      
-      if (smurfIndicator) {
-        smurfs.push(smurfIndicator)
-      }
+    } catch (error) {
+      console.warn('Failed to clear React Query cache:', error)
     }
-
-    return smurfs
   }
 }
 
+// Main function to add smurf detection to the page
 export async function addSmurfDetection() {
+  
+  // Check if we're on a match room page (not scoreboard)
+  if (!isMatchRoomPage()) {
+    return
+  }
+  
+  // Check if already processed
+  if (hasFeatureAttribute('smurf-detection-react-query', document.body)) {
+    return
+  }
+
+  // Wait for content to load
+  await waitForContent()
+
+  // Add global tooltip handler
+  addGlobalTooltipHandler()
+
+  // Clear existing indicators
+  clearExistingIndicators()
+
+  // Show loading indicators
+  addLoadingIndicatorsToPage()
+
+  // Create detector instance
+  const detector = new SmurfDetector()
+
   try {
-    console.log('Smurf detection feature is running...')
-    
-    // Clear existing indicators first
-    clearExistingIndicators()
-    
-    // Add global click handler to hide tooltips
-    addGlobalTooltipHandler()
-    
-    // Wait for content to load
-    await waitForContent()
-    
-    // Create detector instance
-    const detector = new SmurfDetector()
-    
     // Detect smurfs
     const smurfs = await detector.detectSmurfsInMatch()
     
-    if (smurfs.length === 0) {
-      console.log('No smurfs detected')
-      return
-    }
-
-    console.log(`Detected ${smurfs.length} potential smurfs:`, smurfs)
-
-    // Add smurf indicators to the page
-    addSmurfIndicatorsToPage(smurfs)
+    // Clear loading indicators
+    const loadingIndicators = DomQueryService.selectAll('[data-refreak-smurf-loading]')
+    loadingIndicators.forEach((indicator: Element) => indicator.remove())
     
+    if (smurfs.length > 0) {
+      addSmurfIndicatorsToPage(smurfs)
+    }
   } catch (error) {
-    console.error('Failed to add smurf detection:', error)
+    console.error('Failed to add smurf detection with React Query:', error)
+    
+    // Clear loading indicators on error
+    const loadingIndicators = DomQueryService.selectAll('[data-refreak-smurf-loading]')
+    loadingIndicators.forEach((indicator: Element) => indicator.remove())
+  }
+
+  // Mark as processed
+  setFeatureAttribute('smurf-detection-react-query', document.body)
+}
+
+// Helper functions (same as in original file)
+function addGlobalTooltipHandler() {
+  // Add any global tooltip handling logic here
+}
+
+function clearExistingIndicators() {
+  // Remove existing smurf indicators
+  const existingIndicators = DomQueryService.selectAll('[data-refreak-smurf-indicator]')
+  existingIndicators.forEach((indicator: Element) => indicator.remove())
+  
+  // Remove loading indicators from player cards
+  const loadingIndicators = DomQueryService.selectAll('[data-refreak-smurf-loading]')
+  loadingIndicators.forEach((indicator: Element) => indicator.remove())
+  
+  // Remove loading indicators from header
+  const headerLoadingIndicators = DomQueryService.selectAll('[data-refreak-smurf-loading]')
+  headerLoadingIndicators.forEach((indicator: Element) => indicator.remove())
+}
+
+function addLoadingIndicatorsToPage() {
+  const teamElements = DomQueryService.findTeamContainers(document.body)
+  if (!teamElements || teamElements.length === 0) {
+    return
+  }
+
+  for (const teamElement of teamElements) {
+    const playerCards = DomQueryService.findPlayerCards(teamElement)
+    
+    for (const card of playerCards) {
+      addLoadingIndicatorToCard(card)
+    }
+  }
+  
+  // Add loading indicator to header if "Smurf detection" text is found
+  addLoadingIndicatorToHeader()
+}
+
+function addLoadingIndicatorToHeader() {
+  // Look for "Smurf detection" text in the page
+  const walker = document.createTreeWalker(
+    document.body,
+    NodeFilter.SHOW_TEXT,
+    {
+      acceptNode: function(node) {
+        const text = node.textContent?.trim()
+        if (text === 'Smurf detection') {
+          return NodeFilter.FILTER_ACCEPT
+        }
+        return NodeFilter.FILTER_REJECT
+      }
+    }
+  )
+  
+  const smurfDetectionTextNode = walker.nextNode()
+  if (smurfDetectionTextNode && smurfDetectionTextNode.parentElement) {
+    const parentElement = smurfDetectionTextNode.parentElement
+    
+    // Create loading indicator
+    const loadingContainer = document.createElement('div')
+    loadingContainer.setAttribute('data-refreak-smurf-loading', '')
+    loadingContainer.style.display = 'inline-flex'
+    loadingContainer.style.alignItems = 'center'
+    loadingContainer.style.gap = '8px'
+    loadingContainer.style.marginLeft = '8px'
+    
+    // Insert after the text
+    parentElement.appendChild(loadingContainer)
+    
+    // Render loading component
+    renderReactComponent(SmurfDetectionHeaderLoader, {}, loadingContainer)
   }
 }
 
-// Global handler is no longer needed with React popover
-function addGlobalTooltipHandler() {
-  // Popover handles its own positioning and events
-  console.log('Global tooltip handler not needed with React popover')
-}
-
-// Clear existing smurf indicators
-function clearExistingIndicators() {
-  const existingIndicators = document.querySelectorAll('.refreak-smurf-indicator')
-  console.log(`Clearing ${existingIndicators.length} existing smurf indicators`)
+function addLoadingIndicatorToCard(card: Element) {
+  // Try to find ListContentPlayer element first
+  const listContentPlayer = card.querySelector('[data-testid="ListContentPlayer"]') || 
+                           card.querySelector('.ListContentPlayer') ||
+                           card.querySelector('[class*="ListContentPlayer"]')
   
-  existingIndicators.forEach((indicator) => {
-    // Call cleanup function if it exists
-    const cleanupAttr = indicator.getAttribute('data-cleanup')
-    if (cleanupAttr === 'true') {
-      // The cleanup function is stored in the React component
-      // We'll just remove the element and let React handle cleanup
+  if (listContentPlayer) {
+    // Create loading indicator with absolute positioning
+    const loadingContainer = document.createElement('div')
+    loadingContainer.setAttribute('data-refreak-smurf-loading', '')
+    loadingContainer.style.cssText = `
+      position: absolute;
+      right: 0;
+      top: -16px;
+      border-radius: 4px;
+      z-index: 1000;
+    `
+    
+    // Ensure parent has relative positioning
+    const parentElement = listContentPlayer.parentElement
+    if (parentElement) {
+      const parentStyle = parentElement.style
+      if (parentStyle.position !== 'absolute' && parentStyle.position !== 'relative') {
+        parentStyle.position = 'relative'
+      }
     }
-    indicator.remove()
-  })
+    
+    // Insert before ListContentPlayer
+    listContentPlayer.parentNode?.insertBefore(loadingContainer, listContentPlayer)
+    
+    // Render loading component
+    renderReactComponent(SmurfDetectionLoader, {}, loadingContainer)
+    return
+  }
+  
+  // Fallback: Find the nickname element
+  const nicknameElements = Array.from(card.querySelectorAll('[class*="Nickname"]'))
+  let nicknameElement: Element | null = null
+  
+  for (const el of nicknameElements) {
+    const text = el.textContent?.trim()
+    if (text && text.length > 0 && !el.querySelector('svg')) {
+      nicknameElement = el
+      break
+    }
+  }
+  
+  // Fallback to Name elements
+  if (!nicknameElement) {
+    const nameElements = Array.from(card.querySelectorAll('[class*="Name"]'))
+    for (const el of nameElements) {
+      const text = el.textContent?.trim()
+      if (text && text.length > 0 && !el.querySelector('svg')) {
+        nicknameElement = el
+        break
+      }
+    }
+  }
+  
+  if (!nicknameElement) {
+    return
+  }
+
+  // Create and render the loading indicator
+  const loadingContainer = document.createElement('div')
+  loadingContainer.setAttribute('data-refreak-smurf-loading', '')
+  loadingContainer.style.display = 'inline-block'
+  loadingContainer.style.marginLeft = '8px'
+  loadingContainer.style.verticalAlign = 'middle'
+
+  // Insert after nickname
+  nicknameElement.parentNode?.insertBefore(loadingContainer, nicknameElement.nextSibling)
+
+  // Render loading component
+  renderReactComponent(SmurfDetectionLoader, {}, loadingContainer)
 }
 
-// Функция для ожидания загрузки контента
 async function waitForContent(): Promise<void> {
-  return new Promise((resolve) => {
-    let attempts = 0
-    const maxAttempts = 50 // 5 секунд максимум
+  try {
+    await waitForPlayerCards(15000) // 15 second timeout
+  } catch (error) {
+    console.warn('Timeout waiting for player cards, proceeding anyway:', error)
     
-    const checkContent = () => {
-      attempts++
-      console.log(`Checking for content, attempt ${attempts}`)
-      
-      // Проверяем наличие элементов игроков
-      const playerButtons = document.querySelectorAll('[type="button"][aria-haspopup="dialog"]')
-      const avatars = document.querySelectorAll('img[aria-label="avatar"]')
-      const playersText = Array.from(document.querySelectorAll('span,div'))
-        .filter((el: Element) => el.textContent?.includes('Players'))
-      
-      console.log(`Found ${playerButtons.length} player buttons, ${avatars.length} avatars, ${playersText.length} "Players" elements`)
-      
-      // Если нашли достаточно элементов, считаем что контент загружен
-      if (playerButtons.length >= 5 || avatars.length >= 5 || playersText.length >= 2) {
-        console.log('Content loaded successfully')
-        resolve()
-        return
-      }
-      
-      // Если превысили лимит попыток, все равно продолжаем
-      if (attempts >= maxAttempts) {
-        console.log('Max attempts reached, continuing anyway')
-        resolve()
-        return
-      }
-      
-      // Проверяем снова через 100мс
-      setTimeout(checkContent, 100)
+    // Fallback: check if we have at least some content
+    const roomId = MatchRoomUtils.getRoomId()
+    const teamElements = DomQueryService.findTeamContainers(document.body)
+    
+    if (!roomId) {
+      console.warn('No room ID found, but continuing...')
     }
     
-    checkContent()
-  })
+    if (!teamElements || teamElements.length === 0) {
+      console.warn('No team elements found, but continuing...')
+    }
+    
+    // Don't throw error, just log warnings and continue
+    // This allows the detection to proceed even if some elements are missing
+  }
 }
 
 function addSmurfIndicatorsToPage(smurfs: SmurfData[]) {
-  const mainContent = select('#__next')
-  let teamContainers: Element[]
-  if (!mainContent) {
-    console.log('Main content not found in addSmurfIndicatorsToPage, trying document.body')
-    const mainContentFallback = document.body
-    if (!mainContentFallback) {
-      console.log('Neither #__next nor body found in addSmurfIndicatorsToPage')
-      return
-    }
-    console.log('Using document.body as main content in addSmurfIndicatorsToPage')
-    teamContainers = findTeamContainers(mainContentFallback)
-  } else {
-    teamContainers = findTeamContainers(mainContent)
+  
+  const teamElements = DomQueryService.findTeamContainers(document.body)
+  if (!teamElements || teamElements.length === 0) {
+    return
   }
 
-  for (const teamContainer of teamContainers) {
-    const playerCards = findPlayerCards(teamContainer)
+  // Create a map for quick lookup
+  const smurfMap = new Map(smurfs.map(smurf => [smurf.nickname.toLowerCase(), smurf]))
+
+  for (const teamElement of teamElements) {
+    const playerCards = DomQueryService.findPlayerCards(teamElement)
     
-    for (const playerCard of playerCards) {
-      const nickname = extractNickname(playerCard)
+    for (const card of playerCards) {
+      const nickname = DomQueryService.extractNickname(card)
       if (!nickname) continue
 
-      const smurf = smurfs.find(s => s.nickname === nickname)
-      if (!smurf) continue
-
-      // Check if indicator already exists
-      if (playerCard.querySelector('.refreak-smurf-indicator')) {
-        continue
+      const smurf = smurfMap.get(nickname.toLowerCase())
+      if (smurf) {
+        addSmurfIndicatorToCard(card, smurf)
       }
-
-      // Find ListContentPlayer element within the player card
-      const listContentPlayer = playerCard.querySelector('[data-testid="ListContentPlayer"]') || 
-                               playerCard.querySelector('.ListContentPlayer') ||
-                               playerCard.querySelector('[class*="ListContentPlayer"]')
-      
-      if (!listContentPlayer) {
-        console.log(`ListContentPlayer not found for ${nickname}, using fallback positioning`)
-        // Fallback to original positioning
-        const indicator = createSmurfIndicator(smurf)
-        const cardStyle = (playerCard as HTMLElement).style
-        if (cardStyle.position !== 'absolute' && cardStyle.position !== 'relative') {
-          cardStyle.position = 'relative'
-        }
-        playerCard.appendChild(indicator)
-        continue
-      }
-
-      // Create smurf indicator with new positioning
-      const indicator = createSmurfIndicatorOverListContent(smurf)
-      
-      // Ensure parent has relative positioning
-      const parentElement = listContentPlayer.parentElement
-      if (parentElement) {
-        const parentStyle = parentElement.style
-        if (parentStyle.position !== 'absolute' && parentStyle.position !== 'relative') {
-          parentStyle.position = 'relative'
-        }
-      }
-      
-      // Insert indicator before ListContentPlayer
-      listContentPlayer.parentNode?.insertBefore(indicator, listContentPlayer)
     }
   }
 }
 
-function createSmurfIndicator(smurf: SmurfData): HTMLElement {
-  const indicator = document.createElement('div')
-  indicator.className = 'refreak-smurf-indicator'
+function addSmurfIndicatorToCard(card: Element, smurf: SmurfData) {
+  // Try to find ListContentPlayer element first (like in original function)
+  const listContentPlayer = card.querySelector('[data-testid="ListContentPlayer"]') || 
+                           card.querySelector('.ListContentPlayer') ||
+                           card.querySelector('[class*="ListContentPlayer"]')
   
-  indicator.style.cssText = `
-    position: absolute;
-    top: 5px;
-    right: 5px;
-    border-radius: 4px;
-  `
+  if (listContentPlayer) {
+    
+    // Create indicator with absolute positioning
+    const indicatorContainer = document.createElement('div')
+    indicatorContainer.setAttribute('data-refreak-smurf-indicator', '')
+    indicatorContainer.style.cssText = `
+      position: absolute;
+      right: 0;
+      top: -16px;
+      border-radius: 4px;
+      z-index: 1000;
+    `
+    
+    // Ensure parent has relative positioning
+    const parentElement = listContentPlayer.parentElement
+    if (parentElement) {
+      const parentStyle = parentElement.style
+      if (parentStyle.position !== 'absolute' && parentStyle.position !== 'relative') {
+        parentStyle.position = 'relative'
+      }
+    }
+    
+    // Insert before ListContentPlayer
+    listContentPlayer.parentNode?.insertBefore(indicatorContainer, listContentPlayer)
+    
+    // Render React component
+    renderReactComponent(
+      SmurfIndicator,
+      {
+        nickname: smurf.nickname,
+        confidence: smurf.confidence,
+        reasons: smurf.reasons,
+        stats: smurf.stats
+      },
+      indicatorContainer
+    )
+    return
+  }
   
-  // Render React component with popover
-  const cleanup = renderReactComponent(SmurfIndicator, {
-    nickname: smurf.nickname,
-    confidence: smurf.confidence,
-    reasons: smurf.reasons,
-    stats: smurf.stats
-  }, indicator)
+  // Fallback: Find the nickname element using the same logic as extractNickname
+  const nicknameElements = Array.from(card.querySelectorAll('[class*="Nickname"]'))
+  let nicknameElement: Element | null = null
   
-  // Store cleanup function for later use if needed
-  indicator.setAttribute('data-cleanup', 'true')
+  for (const el of nicknameElements) {
+    const text = el.textContent?.trim()
+    if (text && text.length > 0 && !el.querySelector('svg')) {
+      nicknameElement = el
+      break
+    }
+  }
   
-  return indicator
-}
+  // Fallback to Name elements
+  if (!nicknameElement) {
+    const nameElements = Array.from(card.querySelectorAll('[class*="Name"]'))
+    for (const el of nameElements) {
+      const text = el.textContent?.trim()
+      if (text && text.length > 0 && !el.querySelector('svg')) {
+        nicknameElement = el
+        break
+      }
+    }
+  }
+  
+  if (!nicknameElement) {
+    return
+  }
 
-function createSmurfIndicatorOverListContent(smurf: SmurfData): HTMLElement {
-  const indicator = document.createElement('div')
-  indicator.className = 'refreak-smurf-indicator'
-  
-  indicator.style.cssText = `
-    position: absolute;
-    right: 0;
-    top: -16px;
-    border-radius: 4px;
-  `
-  
-  // Render React component with popover
-  const cleanup = renderReactComponent(SmurfIndicator, {
-    nickname: smurf.nickname,
-    confidence: smurf.confidence,
-    reasons: smurf.reasons,
-    stats: smurf.stats
-  }, indicator)
-  
-  // Store cleanup function for later use if needed
-  indicator.setAttribute('data-cleanup', 'true')
-  
-  return indicator
-}
+  // Create and render the smurf indicator
+  const indicatorContainer = document.createElement('div')
+  indicatorContainer.setAttribute('data-refreak-smurf-indicator', '')
+  indicatorContainer.style.display = 'inline-block'
+  indicatorContainer.style.marginLeft = '8px'
+  indicatorContainer.style.verticalAlign = 'middle'
 
-// Tooltip functions removed - using React popover instead 
+  // Insert after nickname
+  nicknameElement.parentNode?.insertBefore(indicatorContainer, nicknameElement.nextSibling)
+
+  // Render React component
+  renderReactComponent(
+    SmurfIndicator,
+    {
+      nickname: smurf.nickname,
+      confidence: smurf.confidence,
+      reasons: smurf.reasons,
+      stats: smurf.stats
+    },
+    indicatorContainer
+  )
+} 

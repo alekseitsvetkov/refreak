@@ -1,11 +1,128 @@
 import { runFeatureIf, systemSettings } from '../hooks/use-settings'
 import { addSmurfDetection } from '../features/add-smurf-detection'
-import { addExtensionToggle } from '../features/add-extension-toggle'
+import { hideCampaigns } from '../features/hide-campaigns'
+import { waitForPlayerCards } from '../lib/utils'
+
+// Function to check if current page is a match room (not scoreboard)
+function isMatchRoomPage(): boolean {
+  const currentUrl = window.location.href
+  
+  // Check for active match room
+  const matchRoomPattern = /^https:\/\/www\.faceit\.com\/[a-z]{2}\/cs2\/room\/[^\/]+$/
+  const isActiveRoom = matchRoomPattern.test(currentUrl)
+  
+  // Check for match results page (new support)
+  const matchResultsPattern = /^https:\/\/www\.faceit\.com\/[a-z]{2}\/cs2\/results\/[^\/]+$/
+  const isResultsPage = matchResultsPattern.test(currentUrl)
+  
+  // Check for any page with player cards (fallback)
+  const hasPlayerCards = document.querySelector('[type="button"][aria-haspopup="dialog"], [class*="ListContentPlayer__Holder"]')
+  const isPageWithPlayers = !!hasPlayerCards
+  
+  return isActiveRoom || isResultsPage || isPageWithPlayers
+}
+
+// Function to check if the page content has actually loaded
+function isPageContentLoaded(): boolean {
+  // Check if we have the main match room content
+  const hasMatchContent = document.querySelector('[class*="MatchRoom"], [class*="match-room"], [class*="Room"]')
+  const hasPlayerContent = document.querySelector('[class*="Player"], [class*="player"], [class*="ListContentPlayer"]')
+  
+  // Check if we have a modal window with match content
+  const hasModal = document.querySelector('#canvas-wrapper, [class*="ContextualView"], [class*="Modal"], [class*="modal"]')
+  const hasModalMatchContent = hasModal && hasModal.querySelector('[class*="MatchRoom"], [class*="ContextualView__Content"]')
+  
+  // Check if we have player cards in any context
+  const hasPlayerCards = document.querySelector('[type="button"][aria-haspopup="dialog"], [class*="ListContentPlayer__Holder"]')
+  
+  const isLoaded = !!(hasMatchContent || hasPlayerContent || hasModalMatchContent || hasPlayerCards)
+  
+  return isLoaded
+}
 
 // Global state to prevent infinite loops
 let isSmurfDetectionRunning = false
 let isExtensionToggleAdded = false
 let lastProcessedUrl = ''
+let lastProcessedHash = ''
+let lastSmurfDetectionTime = 0
+const SMURF_DETECTION_COOLDOWN = 5000 // 5 seconds cooldown
+
+// Function to run smurf detection with smart waiting
+async function runSmurfDetectionWithSmartWaiting() {
+  try {
+    
+    // Wait for player cards to load with increased timeout
+    const playerCards = await waitForPlayerCards(12000) // 12 second timeout
+    
+    
+    await addSmurfDetection()
+  } catch (error) {
+    console.error('Failed to run smurf detection with smart waiting:', error)
+    
+    // Попробуем запустить smurf detection даже без карточек игроков
+    try {
+      await addSmurfDetection()
+    } catch (fallbackError) {
+      console.error('Fallback smurf detection also failed:', fallbackError)
+    }
+  } finally {
+    isSmurfDetectionRunning = false
+  }
+}
+
+// Function to check if we should run smurf detection
+function shouldRunSmurfDetection(): boolean {
+  const currentUrl = window.location.href
+  const currentHash = window.location.hash
+  const now = Date.now()
+  
+  // Check if URL or hash changed and we're on a match room page
+  const urlChanged = currentUrl !== lastProcessedUrl || currentHash !== lastProcessedHash
+  const isMatchRoom = isMatchRoomPage()
+  const contentLoaded = isPageContentLoaded()
+  const cooldownExpired = now - lastSmurfDetectionTime > SMURF_DETECTION_COOLDOWN
+  
+
+  
+  return urlChanged && isMatchRoom && contentLoaded && !isSmurfDetectionRunning && cooldownExpired
+}
+
+// Function to trigger smurf detection
+function triggerSmurfDetection() {
+  if (shouldRunSmurfDetection()) {
+    isSmurfDetectionRunning = true
+    lastProcessedUrl = window.location.href
+    lastProcessedHash = window.location.hash
+    lastSmurfDetectionTime = Date.now()
+    
+    runFeatureIf('smurfDetection', () => {
+      runSmurfDetectionWithSmartWaiting()
+    })
+  }
+}
+
+// Function to check for modal windows and trigger detection
+function checkForModalAndTrigger() {
+  // Check if a modal window has appeared
+  const modal = document.querySelector('#canvas-wrapper, [class*="ContextualView"], [class*="Modal"]')
+  if (modal && !isSmurfDetectionRunning) {
+    
+    // Wait a bit for modal content to load
+    setTimeout(() => {
+      if (isPageContentLoaded() && isMatchRoomPage()) {
+        isSmurfDetectionRunning = true
+        lastProcessedUrl = window.location.href
+        lastProcessedHash = window.location.hash
+        lastSmurfDetectionTime = Date.now()
+        
+        runFeatureIf('smurfDetection', () => {
+          runSmurfDetectionWithSmartWaiting()
+        })
+      }
+    }, 1000)
+  }
+}
 
 async function initContent() {
   let extensionEnabled = false
@@ -21,16 +138,23 @@ async function initContent() {
   }
 
   if (!extensionEnabled) {
-    console.log('Refreak extension is disabled')
     return
   }
-
-  console.log('Refreak extension is enabled, initializing features...')
 
   // Initialize features
   observeBody()
   observeUrlChanges()
   observeHistoryChanges()
+  
+  // Initial check for current page
+  setTimeout(() => {
+    triggerSmurfDetection()
+  }, 1000)
+
+  // Initialize campaign hiding feature
+  runFeatureIf('hideCampaigns', () => {
+    hideCampaigns()
+  })
 }
 
 function observeBody() {
@@ -41,43 +165,38 @@ function observeBody() {
     
     // Run features based on current page and settings
     runFeatureIf('enabled', () => {
-      console.log('Extension is enabled, running features...')
+      // Extension is enabled
     })
 
-    // Only run smurf detection if not already running and URL changed
-    // Also check if we're on a match page (support multiple URL patterns)
-    const currentUrl = window.location.href
-    const isMatchPage = currentUrl.includes('/match/') || 
-                       currentUrl.includes('/room/') ||
-                       currentUrl.includes('/cs2/room/')
+    // Check if we should run smurf detection
+    triggerSmurfDetection()
     
-    if (!isSmurfDetectionRunning && 
-        currentUrl !== lastProcessedUrl && 
-        isMatchPage) {
-      console.log('Match page detected, starting smurf detection...')
-      console.log('Current URL:', currentUrl)
-      console.log('Last processed URL:', lastProcessedUrl)
-      runFeatureIf('smurfDetection', () => {
-        isSmurfDetectionRunning = true
-        lastProcessedUrl = window.location.href
-        addSmurfDetection().finally(() => {
-          isSmurfDetectionRunning = false
-        })
-      })
-    }
+    // Check for modal windows
+    checkForModalAndTrigger()
+
+    // Run campaign hiding feature
+    runFeatureIf('hideCampaigns', () => {
+      hideCampaigns()
+    })
 
     // Add extension toggle UI if not already present
     if (!isExtensionToggleAdded) {
       runFeatureIf('enabled', () => {
-        addExtensionToggle()
         isExtensionToggleAdded = true
       })
     }
     
-    // Reset flag after a short delay
-    setTimeout(() => {
-      isRunning = false
-    }, 2000)
+    // Reset flag using requestIdleCallback for better performance
+    if ('requestIdleCallback' in window) {
+      requestIdleCallback(() => {
+        isRunning = false
+      })
+    } else {
+      // Fallback for older browsers
+      setTimeout(() => {
+        isRunning = false
+      }, 100) // Minimal delay as fallback
+    }
   })
 
   observer.observe(document.body, { childList: true, subtree: true, attributes: false })
@@ -85,49 +204,43 @@ function observeBody() {
 
 function observeUrlChanges() {
   let currentUrl = window.location.href
+  let currentHash = window.location.hash
   
-  // Check for URL changes periodically
-  setInterval(() => {
+  // Check for URL changes periodically with better performance
+  const checkUrl = () => {
     const newUrl = window.location.href
-    if (newUrl !== currentUrl && !isSmurfDetectionRunning) {
-      console.log('URL changed, re-running features...')
-      console.log('Old URL:', currentUrl)
-      console.log('New URL:', newUrl)
+    const newHash = window.location.hash
+    
+    if ((newUrl !== currentUrl || newHash !== currentHash) && !isSmurfDetectionRunning) {
       currentUrl = newUrl
+      currentHash = newHash
       
-      // Wait a bit for the page to load, then run features
+      // Add a small delay to allow page content to start loading
       setTimeout(() => {
-        if (!isSmurfDetectionRunning) {
-          runFeatureIf('smurfDetection', () => {
-            isSmurfDetectionRunning = true
-            lastProcessedUrl = window.location.href
-            addSmurfDetection().finally(() => {
-              isSmurfDetectionRunning = false
-            })
-          })
-        }
-      }, 2000)
+        triggerSmurfDetection()
+      }, 500)
     }
-  }, 2000) // Increased interval to reduce frequency
+    
+    // Schedule next check using requestIdleCallback if available
+    if ('requestIdleCallback' in window) {
+      requestIdleCallback(() => {
+        setTimeout(checkUrl, 1000) // Check every 1 second when idle
+      })
+    } else {
+      setTimeout(checkUrl, 2000) // Fallback: check every 2 seconds
+    }
+  }
+  
+  // Start the URL checking loop
+  checkUrl()
 }
 
 function observeHistoryChanges() {
   // Listen for popstate events (back/forward navigation)
   window.addEventListener('popstate', () => {
-    if (!isSmurfDetectionRunning) {
-      console.log('Navigation detected (popstate), re-running features...')
-      setTimeout(() => {
-        if (!isSmurfDetectionRunning) {
-          runFeatureIf('smurfDetection', () => {
-            isSmurfDetectionRunning = true
-            lastProcessedUrl = window.location.href
-            addSmurfDetection().finally(() => {
-              isSmurfDetectionRunning = false
-            })
-          })
-        }
-      }, 2000)
-    }
+    setTimeout(() => {
+      triggerSmurfDetection()
+    }, 500)
   })
 
   // Override pushState and replaceState to detect programmatic navigation
@@ -136,38 +249,16 @@ function observeHistoryChanges() {
 
   history.pushState = function(...args) {
     originalPushState.apply(history, args)
-    if (!isSmurfDetectionRunning) {
-      console.log('Navigation detected (pushState), re-running features...')
-      setTimeout(() => {
-        if (!isSmurfDetectionRunning) {
-          runFeatureIf('smurfDetection', () => {
-            isSmurfDetectionRunning = true
-            lastProcessedUrl = window.location.href
-            addSmurfDetection().finally(() => {
-              isSmurfDetectionRunning = false
-            })
-          })
-        }
-      }, 2000)
-    }
+    setTimeout(() => {
+      triggerSmurfDetection()
+    }, 500)
   }
 
   history.replaceState = function(...args) {
     originalReplaceState.apply(history, args)
-    if (!isSmurfDetectionRunning) {
-      console.log('Navigation detected (replaceState), re-running features...')
-      setTimeout(() => {
-        if (!isSmurfDetectionRunning) {
-          runFeatureIf('smurfDetection', () => {
-            isSmurfDetectionRunning = true
-            lastProcessedUrl = window.location.href
-            addSmurfDetection().finally(() => {
-              isSmurfDetectionRunning = false
-            })
-          })
-        }
-      }, 2000)
-    }
+    setTimeout(() => {
+      triggerSmurfDetection()
+    }, 500)
   }
 }
 

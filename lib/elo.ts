@@ -70,7 +70,6 @@ export const SKILL_LEVELS_BY_GAME = {
 // TODO: Implement getMatchmakingQueue in faceit-api.ts
 export async function getEloChangesByMatches(matches: any[]) {
   // Temporarily disabled until getMatchmakingQueue is implemented
-  console.log('getEloChangesByMatches: Not implemented yet')
   return null
   
   /*

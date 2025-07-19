@@ -1,6 +1,10 @@
 import { defineConfig } from 'wxt';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'path';
+import { readFileSync } from 'fs';
+
+// Read package.json to get version
+const packageJson = JSON.parse(readFileSync('./package.json', 'utf-8'));
 
 // See https://wxt.dev/api/config.html
 export default defineConfig({
@@ -10,6 +14,9 @@ export default defineConfig({
   },
   vite: () => ({
     plugins: [tailwindcss()],
+    define: {
+      __APP_VERSION__: JSON.stringify(packageJson.version),
+    },
   }),
   manifest: {
     permissions: ['storage'],

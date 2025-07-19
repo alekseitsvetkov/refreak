@@ -1,9 +1,7 @@
 import { storage } from '#imports'
 
-type Theme = 'system' | 'light' | 'dark'
-
 interface AppearanceSettings {
-  theme: Theme
+  // Removed theme setting - always dark theme
 }
 
 interface SystemSettings {
@@ -11,6 +9,8 @@ interface SystemSettings {
   syncInterval: number
   enabled: boolean
   smurfDetection: boolean
+  hideCampaigns: boolean
+  language: 'en' | 'ru'
 }
 
 interface UISettings {
@@ -19,9 +19,7 @@ interface UISettings {
 
 // Define storage items
 export const appearanceSettings = storage.defineItem<AppearanceSettings>('local:appearanceSettings', {
-  fallback: {
-    theme: 'system'
-  }
+  fallback: {}
 })
 
 export const systemSettings = storage.defineItem<SystemSettings>('local:systemSettings', {
@@ -29,7 +27,9 @@ export const systemSettings = storage.defineItem<SystemSettings>('local:systemSe
     notifications: true,
     syncInterval: 15,
     enabled: true,
-    smurfDetection: true
+    smurfDetection: true,
+    hideCampaigns: false,
+    language: 'en'
   }
 })
 
@@ -39,4 +39,4 @@ export const uiSettings = storage.defineItem<UISettings>('local:uiSettings', {
   }
 })
 
-export type { AppearanceSettings, SystemSettings, UISettings, Theme } 
+export type { AppearanceSettings, SystemSettings, UISettings } 
